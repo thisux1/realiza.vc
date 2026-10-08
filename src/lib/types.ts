@@ -337,6 +337,9 @@ export type Dupla = {
   solicitacao_id: string | null;
   /** Link do PDM do mentorado (0044) — https obrigatório quando preenchido. */
   pdm_url?: string | null;
+  /** Dupla encerrada que esta substituiu num remanejamento (0063) —
+   *  null = dupla original, sem linhagem. */
+  remanejada_de?: string | null;
   // ---------- fechamento da trilha especialista (0037) — só trilha =
   // 'especialista' carrega esses campos (CHECK duplas_encerramento_esp) ----------
   /** Carimbo do fechamento da trilha — null enquanto a trilha não fechou. */

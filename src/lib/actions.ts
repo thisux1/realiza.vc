@@ -1301,6 +1301,58 @@ export async function deleteDupla(duplaId: string) {
   if (await demoAtivo()) return { error: DEMO_MSG };
   const { supabase, me: eu } = await me();
   if (!eu) return { error: "Sessão expirada. Entre de novo." };
+  // FKs NO ACTION bloqueiam o delete (a cascata cobre encontros→registros→
+  // anexos, mas supervisões, encerramento, solicitações — via dupla_id e
+  // dupla_dpp_id —, links de formulário e a sucessora do remanejamento são
+  // histórico que não se apaga). O check vem antes de qualquer remoção:
+  // falhar aqui preserva tudo; falhar depois dos anexos deixaria objetos
+  // apagados com a row viva.
+  const [
+    { count: nSup },
+    { count: nEncerr },
+    { count: nSol },
+    { count: nLinks },
+    { count: nSuc },
+  ] = await Promise.all([
+    supabase
+      .from("supervisoes")
+      .select("id", { count: "exact", head: true })
+      .eq("dupla_id", duplaId),
+    supabase
+      .from("encerramentos")
+      .select("id", { count: "exact", head: true })
+      .eq("dupla_id", duplaId),
+    supabase
+      .from("solicitacoes_especialista")
+      .select("id", { count: "exact", head: true })
+      .or(`dupla_id.eq.${duplaId},dupla_dpp_id.eq.${duplaId}`),
+    supabase
+      .from("formulario_links")
+      .select("id", { count: "exact", head: true })
+      .eq("dupla_id", duplaId),
+    supabase
+      .from("duplas")
+      .select("id", { count: "exact", head: true })
+      .eq("remanejada_de", duplaId),
+  ]);
+  const historico = [
+    nSup
+      ? `${nSup} ${nSup === 1 ? "sessão de supervisão" : "sessões de supervisão"}`
+      : null,
+    nEncerr ? "o registro de encerramento" : null,
+    nSol
+      ? `${nSol} ${nSol === 1 ? "solicitação" : "solicitações"} de especialista`
+      : null,
+    nLinks
+      ? `${nLinks} ${nLinks === 1 ? "link" : "links"} de formulário`
+      : null,
+    nSuc ? "a dupla que nasceu do remanejamento dela" : null,
+  ].filter(Boolean);
+  if (historico.length) {
+    return {
+      error: `Essa dupla tem histórico que não pode ser apagado (${historico.join(", ")}). Encerre-a em vez de excluir — o histórico fica salvo.`,
+    };
+  }
   // a cascata leva encontros→registros→registro_anexos (rows), mas os OBJETOS
   // do bucket não seguem o cascade — e a policy de delete do storage exige a
   // row do anexo existir, então a ordem é arquivo primeiro, row depois.
@@ -1344,6 +1396,157 @@ export async function deleteDupla(duplaId: string) {
   revalidatePath("/");
   revalidatePath("/duplas");
   return { ok: true };
+}
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Remanejamento atômico (0063/0064, REALIZA-100): troca UM lado da dupla —
+ *  o RPC rematch_dupla encerra a atual e cria a sucessora herdando turma,
+ *  cronograma, supervisor, demanda e trilha na mesma transação. Os checks
+ *  aqui só antecipam mensagens amigáveis; papel do novo mentor, vaga do
+ *  novo mentorado e status elegível são revalidados no banco. */
+export async function remanejarDupla(
+  duplaId: string,
+  lado: string,
+  novoId: string,
+  motivo: string,
+  registrarNota: boolean
+) {
+  if (await demoAtivo()) return { error: DEMO_MSG };
+  const { supabase, me: eu } = await me();
+  if (!eu) return { error: "Sessão expirada. Entre de novo." };
+  if (eu.role !== "coordenacao") {
+    return { error: "Só a coordenação remaneja duplas." };
+  }
+  if (lado !== "mentor" && lado !== "mentorado") {
+    return { error: "Escolha qual lado da dupla será trocado." };
+  }
+  if (!UUID_RE.test(novoId)) {
+    return { error: "Escolha a pessoa que entra na dupla." };
+  }
+  // estado pré-remanejo — quem sai/fica define as notificações, e os nomes
+  // alimentam as mensagens. O guard "novo ≠ atual" poupa a ida ao RPC no
+  // erro mais provável de dedo.
+  const { data: atual } = await supabase
+    .from("duplas")
+    .select(
+      `id, mentor_id, mentorado_id, supervisor_id, status,
+       mentor:profiles!duplas_mentor_id_fkey(nome),
+       mentorado:mentorados!duplas_mentorado_id_fkey(nome)`
+    )
+    .eq("id", duplaId)
+    .maybeSingle();
+  if (!atual) return { error: "Dupla não encontrada." };
+  const saiId = lado === "mentor" ? atual.mentor_id : atual.mentorado_id;
+  if (novoId === saiId) {
+    return {
+      error:
+        lado === "mentor"
+          ? "Essa pessoa já é o mentor da dupla — pra trocar, escolha outra."
+          : "Essa pessoa já é o mentorado da dupla — pra trocar, escolha outra.",
+    };
+  }
+  const { data: novaDuplaId, error } = await supabase.rpc("rematch_dupla", {
+    p_dupla_id: duplaId,
+    p_lado: lado,
+    p_novo_id: novoId,
+    p_motivo: motivo?.trim() || null,
+    p_registrar_nota: registrarNota === true,
+  });
+  if (error) {
+    // raise exception do RPC chega P0001 já em pt-BR — repassa direto;
+    // o resto segue a tradução comum (mesmo desenho dos actions-* irmãos)
+    return {
+      error:
+        error.code === "P0001" && error.message
+          ? error.message
+          : erroAmigavel(error),
+    };
+  }
+  if (!novaDuplaId) {
+    return {
+      error: "Não foi possível concluir. Recarregue a página e tente de novo.",
+    };
+  }
+
+  // notícias do remanejo. O mentorado não tem login — o sino só alcança
+  // profiles: mentor que entra, mentor que fica, mentor que sai e o
+  // supervisor. Este último CONTINUA na nova dupla, então recebe um aviso
+  // só — não o par "encerrada + formada" que a leitura literal do
+  // updateDupla mandaria.
+  const norm = <T,>(v: T | T[] | null | undefined): T | null =>
+    Array.isArray(v) ? (v[0] ?? null) : (v ?? null);
+  const nomeMentor = norm(atual.mentor)?.nome ?? null;
+  const nomeMd = norm(atual.mentorado)?.nome ?? null;
+  let nomeNovo: string | null = null;
+  if (lado === "mentor") {
+    const { data: p } = await supabase
+      .from("profiles").select("nome").eq("id", novoId).single();
+    nomeNovo = p?.nome ?? null;
+  } else {
+    const { data: m } = await supabase
+      .from("mentorados").select("nome").eq("id", novoId).single();
+    nomeNovo = m?.nome ?? null;
+  }
+  await notificar(
+    supabase,
+    [
+      lado === "mentor"
+        ? {
+            // o novo mentor assume — mesma notícia do updateDupla
+            profile_id: novoId,
+            tipo: "dupla_formada",
+            titulo: "Você assumiu uma dupla",
+            corpo: nomeMd
+              ? `Você e ${nomeMd}: vejam onde a jornada está.`
+              : null,
+            href: `/duplas/${novaDuplaId}`,
+          }
+        : {
+            // o mentor fica e o par muda — a ficha nova é dele também
+            profile_id: atual.mentor_id,
+            tipo: "dupla_formada",
+            titulo: "Seu mentorado mudou",
+            corpo: nomeNovo
+              ? `Agora a mentoria é com ${nomeNovo}. A coordenação reorganizou as duplas.`
+              : "A coordenação reorganizou as duplas.",
+            href: `/duplas/${novaDuplaId}`,
+          },
+      lado === "mentor" && atual.mentor_id
+        ? {
+            // quem sai não enxerga mais a ficha (RLS) — link cai na home
+            profile_id: atual.mentor_id,
+            tipo: "dupla_formada",
+            titulo: "Sua dupla mudou de mentor",
+            corpo: nomeMd
+              ? `A dupla com ${nomeMd} segue com outro mentor. A coordenação reorganizou as duplas.`
+              : "A coordenação reorganizou as duplas.",
+            href: "/",
+          }
+        : null,
+      atual.supervisor_id
+        ? {
+            profile_id: atual.supervisor_id,
+            tipo: "dupla_formada",
+            titulo: "Dupla supervisionada remanejada",
+            corpo:
+              lado === "mentor"
+                ? `${nomeMentor ?? "O mentor"} saiu${nomeNovo ? ` e ${nomeNovo} assumiu` : ""} a mentoria${nomeMd ? ` de ${nomeMd}` : ""}.`
+                : `${nomeMd ?? "O mentorado"} saiu${nomeNovo ? ` e ${nomeNovo} entrou` : ""} na mentoria${nomeMentor ? ` com ${nomeMentor}` : ""}.`,
+            href: `/duplas/${novaDuplaId}`,
+          }
+        : null,
+    ].filter((r): r is NonNullable<typeof r> => r !== null),
+    eu.id
+  );
+  revalidatePath("/");
+  revalidatePath("/duplas");
+  revalidatePath(`/duplas/${duplaId}`);
+  revalidatePath(`/duplas/${novaDuplaId}`);
+  revalidatePath("/pessoas");
+  revalidatePath(`/pessoas/${saiId}`);
+  return { ok: true, novaDuplaId };
 }
 
 /** Link do PDM (0044): mentor edita o da própria dupla — UPDATE em duplas é
