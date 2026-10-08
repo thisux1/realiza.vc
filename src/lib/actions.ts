@@ -33,6 +33,14 @@ import {
   papelNulo,
   type LinhaImportada,
 } from "@/lib/importar";
+import {
+  previewPar,
+  resolverPares,
+  saneiaLinhaPar,
+  type DiretorioPar,
+  type LinhaPar,
+  type ResolucaoPar,
+} from "@/lib/importar-duplas";
 import { notificar } from "./notificar";
 import { ROLES_POR_AUDIENCIA } from "@/lib/email";
 import {
@@ -1755,6 +1763,210 @@ export async function importMentorados(rows: LinhaImportada[]) {
   if (error) return { error: erroAmigavel(error) };
   revalidatePath("/pessoas");
   return { ok: true, criados: validas.length, puladas };
+}
+
+// ---------- pareamento em lote (REALIZA-102) ----------
+
+/** Diretório do pareamento — uma leva de selects por lote, depois a
+ *  resolução (importar-duplas.ts) é toda em memória. E-mail de profile vem
+ *  da view profiles_contato (a coluna saiu do grant em 0026) e junta por id;
+ *  mentorados leem e-mail direto da tabela. As duplas chegam em qualquer
+ *  status — a derivação de turma da especialista olha o histórico e os
+ *  checks de vaga filtram ativa/pausada por dentro. */
+async function diretorioPareamento(supabase: Supa): Promise<DiretorioPar> {
+  const [
+    { data: profs },
+    { data: contatos },
+    { data: mdos },
+    { data: dups },
+    { data: crons },
+    { data: mps },
+    { data: evs },
+  ] = await Promise.all([
+    supabase.from("profiles").select("id, nome, role, ativo, nome_social"),
+    supabase.from("profiles_contato").select("id, email"),
+    supabase.from("mentorados").select("id, nome, email, nome_social"),
+    supabase
+      .from("duplas")
+      .select("mentor_id, mentorado_id, trilha, status, turma, created_at"),
+    supabase
+      .from("cronogramas")
+      .select("id, nome, turma, status, inicio_em, fim_em, created_at"),
+    supabase.from("mentor_profiles").select("profile_id, capacidade"),
+    supabase.from("ciclo_eventos").select("cronograma_id, tipo, data"),
+  ]);
+  const emailPorId = new Map((contatos ?? []).map((c) => [c.id, c.email]));
+  return {
+    profiles: (profs ?? []).map((p) => ({
+      ...p,
+      email: emailPorId.get(p.id) ?? null,
+    })),
+    mentorados: mdos ?? [],
+    duplas: dups ?? [],
+    cronogramas: (crons ?? []) as Cronograma[],
+    capacidades: new Map((mps ?? []).map((m) => [m.profile_id, m.capacidade])),
+    eventos: evs ?? [],
+  };
+}
+
+/** Mesmo diretório montado sobre o dataset demo — a prévia do dialog
+ *  funciona em /demo sem tocar no banco. As duplas demo não têm created_at;
+ *  iniciada_em serve de desempate na derivação de turma. */
+function diretorioPareamentoDemo(): DiretorioPar {
+  const d = getDemoData();
+  return {
+    profiles: d.profiles.map((p) => ({
+      id: p.id,
+      nome: p.nome,
+      email: p.email,
+      nome_social: p.nome_social ?? null,
+      role: p.role,
+      ativo: p.ativo,
+    })),
+    mentorados: d.mentorados.map((m) => ({
+      id: m.id,
+      nome: m.nome,
+      email: m.email,
+      nome_social: m.nome_social ?? null,
+    })),
+    duplas: d.duplas.map((x) => ({
+      mentor_id: x.mentor.id,
+      mentorado_id: x.mentorado.id,
+      trilha: x.trilha,
+      status: x.status,
+      turma: x.turma,
+      created_at: x.iniciada_em ?? "",
+    })),
+    cronogramas: d.cronogramas,
+    capacidades: new Map(
+      d.mentorProfiles.map((m) => [m.profile_id, m.capacidade])
+    ),
+    eventos: d.cicloEventos.map((e) => ({
+      cronograma_id: e.cronograma_id,
+      tipo: e.tipo,
+      data: e.data,
+    })),
+  };
+}
+
+/** Prévia do pareamento — resolve contra o diretório SEM escrever nada.
+ *  O resultado é o que importDuplas veria na hora do clique (salvo drift
+ *  de dados entre os dois — por isso o import re-resolve de qualquer jeito). */
+export async function previewDuplas(linhas: LinhaPar[]) {
+  const saneadas = (linhas ?? []).map(saneiaLinhaPar);
+  if (saneadas.length > MAX_IMPORT) {
+    return {
+      error: `O arquivo tem ${saneadas.length} linhas. Importe em lotes de até ${MAX_IMPORT}.`,
+    };
+  }
+  if (await demoAtivo()) {
+    return {
+      ok: true as const,
+      resolucoes: resolverPares(saneadas, diretorioPareamentoDemo()).map(
+        previewPar
+      ),
+    };
+  }
+  const { supabase, me: eu } = await me();
+  if (!eu) return { error: "Sessão expirada. Entre de novo." };
+  if (eu.role !== "coordenacao") {
+    return { error: "Só a coordenação importa pareamentos." };
+  }
+  const dir = await diretorioPareamento(supabase);
+  return {
+    ok: true as const,
+    resolucoes: resolverPares(saneadas, dir).map(previewPar),
+  };
+}
+
+/** Aplica o pareamento linha a linha — nunca all-or-nothing: cada linha já
+ *  chega resolvida por resolverPares e o insert é individual, então erro de
+ *  constraint (vaga do mentorado, capacidade do mentor) vira "pulada" com
+ *  motivo legível e o lote segue. Cada dupla criada notifica mentor e
+ *  supervisor — o mesmo aviso do cadastro manual (createDupla), em um insert
+ *  único no fim. */
+export async function importDuplas(linhas: LinhaPar[]) {
+  if (await demoAtivo()) return { error: DEMO_MSG };
+  const { supabase, me: eu } = await me();
+  if (!eu) return { error: "Sessão expirada. Entre de novo." };
+  if (eu.role !== "coordenacao") {
+    return { error: "Só a coordenação importa pareamentos." };
+  }
+  const saneadas = (linhas ?? []).map(saneiaLinhaPar);
+  if (saneadas.length > MAX_IMPORT) {
+    return {
+      error: `O arquivo tem ${saneadas.length} linhas. Importe em lotes de até ${MAX_IMPORT}.`,
+    };
+  }
+  const dir = await diretorioPareamento(supabase);
+  const resolucoes = resolverPares(saneadas, dir);
+  const puladas: string[] = [];
+  const criadas: { id: string; r: ResolucaoPar }[] = [];
+
+  for (const r of resolucoes) {
+    const p = r.par;
+    if (r.status !== "ok" || !p) {
+      puladas.push(`Linha ${r.linha.n}: ${r.motivo ?? "não resolvida"}`);
+      continue;
+    }
+    const { data: nova, error } = await supabase
+      .from("duplas")
+      .insert({
+        mentor_id: p.mentor.id,
+        mentorado_id: p.mentorado.id,
+        supervisor_id: p.supervisor?.id ?? null,
+        iniciada_em: p.iniciadaEm,
+        trilha: p.trilha,
+        // demanda grava nas duas trilhas — o script da Turma 2 escreveu o
+        // "eixo da mentoria" também nas DPP e a coluna aceita
+        demanda: p.demanda,
+        cronograma_id: p.cronogramaId,
+        turma: p.turma,
+        status: "ativa",
+      })
+      .select("id")
+      .single();
+    if (error) {
+      puladas.push(
+        `Linha ${r.linha.n} (${p.mentorado.nome} × ${p.mentor.nome}): ${erroAmigavel(error)}`
+      );
+      continue;
+    }
+    criadas.push({ id: nova.id, r });
+  }
+
+  // uma notificação por dupla criada — pareamento em lote é o mesmo
+  // pareamento do dialog, o mentor precisa saber que a dupla existe
+  if (criadas.length) {
+    await notificar(
+      supabase,
+      criadas.flatMap((c) => {
+        const p = c.r.par!;
+        return [
+          {
+            profile_id: p.mentor.id,
+            tipo: "dupla_formada",
+            titulo: "Sua dupla foi formada",
+            corpo: `Você e ${p.mentorado.nome}: combinem o 1º encontro.`,
+            href: `/duplas/${c.id}`,
+          },
+          {
+            profile_id: p.supervisor?.id,
+            tipo: "dupla_formada",
+            titulo: "Nova dupla sob sua supervisão",
+            corpo: `${p.mentorado.nome} × ${p.mentor.nome}: acompanhe a ficha da dupla.`,
+            href: `/duplas/${c.id}`,
+          },
+        ];
+      }),
+      eu.id
+    );
+  }
+
+  revalidatePath("/duplas");
+  revalidatePath("/");
+  revalidatePath("/pessoas");
+  return { ok: true, criadas: criadas.length, puladas };
 }
 
 // ---------- encontros (mentor da dupla) ----------
