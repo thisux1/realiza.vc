@@ -158,6 +158,10 @@ export type Mentorado = {
   /** Payload integral da resposta do form de inscrição (0054).
    *  Sensível (mentorados_pessoal). */
   form_bruto?: Record<string, unknown> | null;
+  /** Carimbo de criação do cadastro — vem em MENTORADO_COLS_PUBLICAS;
+   *  opcional como o de Profile (selects parciais/personas demo podem
+   *  não trazer). Base da "espera" da fila quando o intake não tem carimbo. */
+  created_at?: string;
 };
 
 /** mentor_profiles — ficha do mentor que alimenta o board de matching
