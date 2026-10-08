@@ -1287,6 +1287,14 @@ export function papelCurto(role: string | null | undefined) {
   }
 }
 
+/** Quem pode ser `supervisor_id` de uma dupla: o papel supervisor e a
+ *  coordenação — na operação real os supervisores ativos são da equipe
+ *  executiva. Uma régua só pros selects de dupla e pras actions; o banco
+ *  não olha papel (as policies trabalham com o vínculo supervisor_id). */
+export function podeSupervisionar(role: string | null | undefined): boolean {
+  return role === "supervisor" || role === "coordenacao";
+}
+
 export function waLink(phone: string | null | undefined, mensagem: string): string | null {
   if (!phone) return null;
   const digits = phone.replace(/\D/g, "");

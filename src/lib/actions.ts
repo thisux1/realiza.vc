@@ -15,6 +15,7 @@ import {
   inicioDefaultDupla,
   maxEncontros,
   parseDisponibilidade,
+  podeSupervisionar,
 } from "@/lib/ciclo";
 import { capitalizar, cpfValido, erroAmigavel, nomeProprio } from "@/lib/utils";
 import type { ComunicadoPrioridade, CorRaca, Cronograma, DadosCivis, Disponibilidade, DocumentoPessoa, Endereco, Escolaridade, Genero, Notificacao, PrefGeneroPar, ResponsavelCivis, Trilha } from "@/lib/types";
@@ -637,8 +638,8 @@ export async function createDupla(formData: FormData) {
   if (supervisorFinal) {
     const { data: supervisor } = await supabase
       .from("profiles").select("role").eq("id", supervisorFinal).single();
-    if (supervisor?.role !== "supervisor") {
-      return { error: "A pessoa escolhida como supervisor não tem esse papel." };
+    if (!podeSupervisionar(supervisor?.role)) {
+      return { error: "A pessoa escolhida como supervisor não pode supervisionar." };
     }
   }
   // um mentorado ocupa uma vaga POR trilha, em qualquer turma — a dupla de
@@ -1123,8 +1124,8 @@ export async function updateDupla(duplaId: string, formData: FormData) {
   if (supervisorFinal) {
     const { data: supervisor } = await supabase
       .from("profiles").select("role").eq("id", supervisorFinal).single();
-    if (supervisor?.role !== "supervisor") {
-      return { error: "A pessoa escolhida como supervisor não tem esse papel." };
+    if (!podeSupervisionar(supervisor?.role)) {
+      return { error: "A pessoa escolhida como supervisor não pode supervisionar." };
     }
   }
   // só ocupa vaga quem vai pra ativa/pausada — concluída e encerrada liberam,
